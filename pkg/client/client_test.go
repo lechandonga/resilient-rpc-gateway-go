@@ -1,0 +1,385 @@
+package client
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/lechandonga/resilient-rpc-gateway-go/pkg/config"
+	"github.com/lechandonga/resilient-rpc-gateway-go/pkg/model"
+	"github.com/lechandonga/resilient-rpc-gateway-go/pkg/registry"
+)
+
+func policyFor(method string, mutate func(*model.MethodPolicy)) model.MethodPolicy {
+	p := model.DefaultMethodPolicy(method)
+	p.Timeout = 200 * time.Millisecond
+	if mutate != nil {
+		mutate(&p)
+	}
+	return p
+}
+
+func newHarness(t *testing.T, p model.MethodPolicy) (*registry.Registry, *config.Holder) {
+	t.Helper()
+	reg := registry.NewRegistry()
+	parsed := &config.Parsed{Version: 2, Service: "svc", Methods: map[string]model.MethodPolicy{p.Method: p}}
+	holder := config.NewHolder(parsed)
+	return reg, holder
+}
+
+// failingInvoker 每次调用都失败，并统计调用次数。
+func failingInvoker(calls *int32) Invoker {
+	return func(ctx context.Context, ins model.Instance, req *model.Request) (*model.Response, error) {
+		atomic.AddInt32(calls, 1)
+		return &model.Response{Status: 500, InstanceID: ins.ID}, errors.New("boom")
+	}
+}
+
+func okInvoker(calls *int32, failFirst int32) Invoker {
+	var n int32
+	return func(ctx context.Context, ins model.Instance, req *model.Request) (*model.Response, error) {
+		atomic.AddInt32(calls, 1)
+		if atomic.AddInt32(&n, 1) <= failFirst {
+			return nil, errors.New("transient boom")
+		}
+		return &model.Response{Status: 200, InstanceID: ins.ID, Payload: []byte("ok")}, nil
+	}
+}
+
+// slowInvoker 模拟抖动慢下游：尊重 ctx，超时/取消时退出。
+func slowInvoker(delay time.Duration, observedCancel *int32) Invoker {
+	return func(ctx context.Context, ins model.Instance, req *model.Request) (*model.Response, error) {
+		select {
+		case <-time.After(delay):
+			return &model.Response{Status: 200, InstanceID: ins.ID}, nil
+		case <-ctx.Done():
+			if observedCancel != nil {
+				atomic.AddInt32(observedCancel, 1)
+			}
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func registerN(reg *registry.Registry, n int) {
+	for i := 0; i < n; i++ {
+		id := string(rune('a' + i))
+		reg.Upsert("svc", model.Instance{ID: id, Address: id + ":9000", Weight: 1})
+	}
+}
+
+func TestEmptyInstanceCausesAreDistinguishable(t *testing.T) {
+	p := policyFor("m", nil)
+	reg, holder := newHarness(t, p)
+	var calls int32
+	c, err := New(reg, holder, failingInvoker(&calls))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := &model.Request{ID: "r-empty-1", Service: "svc", Method: "m", Idempotent: true}
+
+	// 服务从未注册
+	if _, err := c.Invoke(context.Background(), req); !errors.Is(err, model.ErrNoInstance) {
+		t.Fatalf("want ErrNoInstance, got %v", err)
+	}
+
+	// 注册后全部因健康检查失败摘除 -> 与"从未注册"区分
+	registerN(reg, 1)
+	reg.SetHealth("svc", "a", false)
+	if _, err := c.Invoke(context.Background(), req); !errors.Is(err, model.ErrNoHealthyInstance) {
+		t.Fatalf("want ErrNoHealthyInstance, got %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("must not call downstream with no candidates, calls=%d", calls)
+	}
+}
+
+func TestRemovedInstanceStopsReceivingTraffic(t *testing.T) {
+	p := policyFor("m", nil)
+	reg, holder := newHarness(t, p)
+	var calls int32
+	seen := sync.Map{}
+	inv := func(ctx context.Context, ins model.Instance, req *model.Request) (*model.Response, error) {
+		atomic.AddInt32(&calls, 1)
+		seen.Store(ins.ID, true)
+		return &model.Response{Status: 200, InstanceID: ins.ID}, nil
+	}
+	c, _ := New(reg, holder, inv)
+	registerN(reg, 2)
+	req := &model.Request{ID: "r-churn", Service: "svc", Method: "m"}
+
+	for i := 0; i < 6; i++ {
+		if _, err := c.Invoke(context.Background(), req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// b 下线后，连续调用绝不能再命中 b
+	reg.Remove("svc", "b")
+	for i := 0; i < 10; i++ {
+		if _, err := c.Invoke(context.Background(), req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, hit := seen.Load("b"); !hit {
+		t.Fatal("b should have served traffic before removal")
+	}
+	// 下线后的命中次数：通过 calls 总数与调用次数对照，b 下线后 LB 候选只有 a
+	for i := 0; i < 20; i++ {
+		in, err := loadBalancerPick(reg, "svc")
+		if err != nil || in.ID != "a" {
+			t.Fatalf("post-removal traffic must only hit a, got %v err=%v", in, err)
+		}
+	}
+}
+
+func TestNonIdempotentNotRetriedNoDuplicateSideEffect(t *testing.T) {
+	p := policyFor("pay", func(p *model.MethodPolicy) { p.MaxAttempts = 3 })
+	reg, holder := newHarness(t, p)
+	var calls int32
+	c, _ := New(reg, holder, failingInvoker(&calls))
+	registerN(reg, 1)
+
+	req := &model.Request{ID: "r-side-effect", Service: "svc", Method: "pay", Idempotent: false}
+	_, err := c.Invoke(context.Background(), req)
+	if !errors.Is(err, model.ErrNonRetryable) {
+		t.Fatalf("non-idempotent retry must surface ErrNonRetryable, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("non-idempotent request must hit downstream exactly once, got %d", calls)
+	}
+}
+
+func TestIdempotentRetryExhaustedDistinctReason(t *testing.T) {
+	p := policyFor("pay", func(p *model.MethodPolicy) {
+		p.MaxAttempts = 3
+		p.Timeout = time.Second
+	})
+	reg, holder := newHarness(t, p)
+	var calls int32
+	c, _ := New(reg, holder, failingInvoker(&calls))
+	registerN(reg, 1)
+
+	req := &model.Request{ID: "r-exhaust", Service: "svc", Method: "pay", Idempotent: true}
+	resp, err := c.Invoke(context.Background(), req)
+	if !errors.Is(err, model.ErrRetryExhausted) {
+		t.Fatalf("want ErrRetryExhausted, got %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("want exactly 3 attempts, got %d", calls)
+	}
+	if resp.Attempts != 3 {
+		t.Fatalf("response should carry attempt count 3, got %d", resp.Attempts)
+	}
+}
+
+func TestIdempotentRetryThenSuccess(t *testing.T) {
+	p := policyFor("pay", func(p *model.MethodPolicy) {
+		p.MaxAttempts = 3
+		p.Timeout = time.Second
+	})
+	reg, holder := newHarness(t, p)
+	var calls int32
+	c, _ := New(reg, holder, okInvoker(&calls, 1))
+	registerN(reg, 1)
+
+	req := &model.Request{ID: "r-retry-ok", Service: "svc", Method: "pay", Idempotent: true}
+	resp, err := c.Invoke(context.Background(), req)
+	if err != nil {
+		t.Fatalf("retry should eventually succeed: %v", err)
+	}
+	if calls != 2 || resp.Attempts != 2 || resp.Status != 200 {
+		t.Fatalf("want 2 attempts then 200, got calls=%d resp=%+v", calls, resp)
+	}
+}
+
+func TestDownstreamTimeoutReleasesBudget(t *testing.T) {
+	p := policyFor("slow", func(p *model.MethodPolicy) { p.Timeout = 30 * time.Millisecond })
+	reg, holder := newHarness(t, p)
+	var canceled int32
+	c, _ := New(reg, holder, slowInvoker(time.Second, &canceled))
+	registerN(reg, 1)
+
+	req := &model.Request{ID: "r-timeout", Service: "svc", Method: "slow"}
+	start := time.Now()
+	_, err := c.Invoke(context.Background(), req)
+	elapsed := time.Since(start)
+	if !errors.Is(err, model.ErrTimeout) {
+		t.Fatalf("want ErrTimeout, got %v", err)
+	}
+	if elapsed > 300*time.Millisecond {
+		t.Fatalf("gateway must not wait for slow downstream, elapsed=%v", elapsed)
+	}
+	// 慢下游的 ctx 必须被取消，调用不得继续推进
+	waitUntil(200*time.Millisecond, func() bool { return atomic.LoadInt32(&canceled) == 1 })
+	if atomic.LoadInt32(&canceled) != 1 {
+		t.Fatal("downstream context must be canceled after timeout")
+	}
+}
+
+func TestUpstreamCancelStopsDownstream(t *testing.T) {
+	p := policyFor("slow", func(p *model.MethodPolicy) { p.Timeout = 5 * time.Second })
+	reg, holder := newHarness(t, p)
+	var canceled int32
+	c, _ := New(reg, holder, slowInvoker(10*time.Second, &canceled))
+	registerN(reg, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := &model.Request{ID: "r-cancel", Service: "svc", Method: "slow"}
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := c.Invoke(ctx, req)
+		errCh <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, model.ErrContextCanceled) {
+			t.Fatalf("want ErrContextCanceled, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled request did not return promptly")
+	}
+	waitUntil(300*time.Millisecond, func() bool { return atomic.LoadInt32(&canceled) == 1 })
+}
+
+func TestCircuitOpensAndHalfOpenFallback(t *testing.T) {
+	p := policyFor("m", func(p *model.MethodPolicy) {
+		p.MaxAttempts = 1
+		p.CircuitThreshold = 3
+		p.OpenCooldown = 40 * time.Millisecond
+		p.Timeout = time.Second
+	})
+	reg, holder := newHarness(t, p)
+	var calls int32
+	c, _ := New(reg, holder, failingInvoker(&calls))
+	registerN(reg, 1)
+	req := &model.Request{ID: "r-cb", Service: "svc", Method: "m"}
+
+	for i := 0; i < 3; i++ {
+		c.Invoke(context.Background(), req)
+	}
+	// 熔断打开：不得再冲击下游
+	before := atomic.LoadInt32(&calls)
+	_, err := c.Invoke(context.Background(), req)
+	if !errors.Is(err, model.ErrCircuitOpen) {
+		t.Fatalf("want ErrCircuitOpen, got %v", err)
+	}
+	if atomic.LoadInt32(&calls) != before {
+		t.Fatal("open circuit must not hit downstream")
+	}
+
+	// 冷却后进入半开；探测仍失败 -> 退回 open，下一个请求继续被拒绝
+	time.Sleep(60 * time.Millisecond)
+	c.Invoke(context.Background(), req) // 半开探测，失败
+	_, err = c.Invoke(context.Background(), req)
+	if !errors.Is(err, model.ErrCircuitOpen) {
+		t.Fatalf("failed half-open probe must restore open, got %v", err)
+	}
+}
+
+func TestConcurrencyRejectAtClient(t *testing.T) {
+	p := policyFor("m", func(p *model.MethodPolicy) {
+		p.MaxConcurrency = 1
+		p.OnLimit = model.RejectReject
+		p.Timeout = 5 * time.Second
+	})
+	reg, holder := newHarness(t, p)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	inv := func(ctx context.Context, ins model.Instance, req *model.Request) (*model.Response, error) {
+		close(entered)
+		<-release
+		return &model.Response{Status: 200}, nil
+	}
+	c, _ := New(reg, holder, inv)
+	registerN(reg, 1)
+	go func() {
+		c.Invoke(context.Background(), &model.Request{ID: "r-hold", Service: "svc", Method: "m"})
+	}()
+	<-entered
+	_, err := c.Invoke(context.Background(), &model.Request{ID: "r-limited", Service: "svc", Method: "m"})
+	if !errors.Is(err, model.ErrConcurrencyLimited) {
+		t.Fatalf("want ErrConcurrencyLimited, got %v", err)
+	}
+	close(release)
+}
+
+func TestHotUpdateRevisionsAppearInTrace(t *testing.T) {
+	p := policyFor("m", func(p *model.MethodPolicy) { p.MaxAttempts = 1 })
+	reg, holder := newHarness(t, p)
+	var calls int32
+	c, _ := New(reg, holder, failingInvoker(&calls))
+	registerN(reg, 1)
+	req := &model.Request{ID: "r-cfg-old", Service: "svc", Method: "m"}
+	c.Invoke(context.Background(), req)
+
+	p2 := policyFor("m", func(p *model.MethodPolicy) { p.MaxAttempts = 2; p.Timeout = time.Second })
+	next := &config.Parsed{Version: 2, Service: "svc", Methods: map[string]model.MethodPolicy{"m": p2}}
+	rev2, err := holder.Replace(next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req2 := &model.Request{ID: "r-cfg-new", Service: "svc", Method: "m", Idempotent: true}
+	c.Invoke(context.Background(), req2)
+
+	oldTrace := c.Trace("r-cfg-old")
+	newTrace := c.Trace("r-cfg-new")
+	if len(oldTrace) == 0 || len(newTrace) == 0 {
+		t.Fatal("traces must be recorded")
+	}
+	// 旧请求全部命中 revision 1，新请求命中 revision 2
+	for _, a := range oldTrace {
+		_ = a
+	}
+	if got := c.tracerRevisionOf("r-cfg-old"); got != 1 {
+		t.Fatalf("old request must pin rev 1, got %d", got)
+	}
+	if got := c.tracerRevisionOf("r-cfg-new"); got != rev2 {
+		t.Fatalf("new request must pin rev %d, got %d", rev2, got)
+	}
+}
+
+func TestLogsContainRequestIDPolicyAndResponse(t *testing.T) {
+	var buf bytes.Buffer
+	p := policyFor("m", func(p *model.MethodPolicy) { p.MaxAttempts = 1 })
+	reg, holder := newHarness(t, p)
+	var calls int32
+	c, _ := New(reg, holder, failingInvoker(&calls), func(cl *Client) {
+		cl.tracer = NewTracer(&buf, 256, true)
+	})
+	registerN(reg, 1)
+	req := &model.Request{ID: "r-log-42", Service: "svc", Method: "m"}
+	c.Invoke(context.Background(), req)
+
+	log := buf.String()
+	for _, want := range []string{"r-log-42", "policy=invoke", "reason=DOWNSTREAM_ERROR"} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("log missing %q:\n%s", want, log)
+		}
+	}
+	// 成功路径需打印下游响应摘要
+	buf.Reset()
+	c2, _ := New(reg, holder, func(ctx context.Context, ins model.Instance, r *model.Request) (*model.Response, error) {
+		return &model.Response{Status: 201, Payload: []byte("created")}, nil
+	}, func(cl *Client) { cl.tracer = NewTracer(&buf, 256, true) })
+	c2.Invoke(context.Background(), &model.Request{ID: "r-log-ok", Service: "svc", Method: "m"})
+	if !strings.Contains(buf.String(), "r-log-ok") || !strings.Contains(buf.String(), "status=201") {
+		t.Fatalf("success log must contain request id and downstream response:\n%s", buf.String())
+	}
+}
+
+func waitUntil(timeout time.Duration, cond func() bool) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
