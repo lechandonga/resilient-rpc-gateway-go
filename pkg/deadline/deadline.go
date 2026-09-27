@@ -27,6 +27,14 @@ func New(parentDeadline time.Time, perCall time.Duration) *Propagation {
 	}
 }
 
+// WithClock 注入时钟（测试 / 与治理层统一时钟时使用），返回自身便于链式调用。
+func (p *Propagation) WithClock(now func() time.Time) *Propagation {
+	if now != nil {
+		p.now = now
+	}
+	return p
+}
+
 // Remaining 返回当前剩余预算；ok=false 表示预算已经耗尽或上游已取消。
 func (p *Propagation) Remaining() (time.Duration, bool) {
 	d, ok := p.remainingAt(p.now())
@@ -65,8 +73,21 @@ func (p *Propagation) ChildContext(parent context.Context) (context.Context, con
 }
 
 // Classify 把 context 的结束原因映射为可区分的治理错误：
-// 上游主动取消 -> ErrContextCanceled；预算到期 -> ErrTimeout。
+//   - 排空宽限期用尽驱动的取消 -> ErrDrainTimeout（优先于 ctx.Err() 的表面类型）；
+//   - 上游主动取消 -> ErrContextCanceled；
+//   - 预算到期 -> ErrTimeout。
+//
+// 子 ctx 经 context.WithCancelCause / WithTimeoutCause 会携带 cause，
+// 因此即便表面是 DeadlineExceeded 也能还原真正的决策原因。
 func Classify(ctx context.Context) error {
+	if cause := context.Cause(ctx); cause != nil {
+		switch {
+		case errors.Is(cause, model.ErrDrainTimeout):
+			return model.ErrDrainTimeout
+		case errors.Is(cause, model.ErrDrainRejected):
+			return model.ErrDrainRejected
+		}
+	}
 	switch {
 	case errors.Is(ctx.Err(), context.Canceled):
 		return model.ErrContextCanceled

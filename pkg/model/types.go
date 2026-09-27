@@ -22,6 +22,10 @@ var (
 	ErrConcurrencyLimited = newGovError("GATEWAY_CONCURRENCY_LIMITED", "concurrency limit exceeded")
 	// ErrQueueFull 等待队列已满。
 	ErrQueueFull = newGovError("GATEWAY_QUEUE_FULL", "pending queue is full")
+	// ErrDrainRejected 排空期间不接受新请求（实例摘除排空或进程停止排空）。
+	ErrDrainRejected = newGovError("GATEWAY_DRAIN_REJECTED", "drain in progress, new request rejected")
+	// ErrDrainTimeout 排空宽限期用尽：在途请求被强制中止，或 Drain 等待排空超时。
+	ErrDrainTimeout = newGovError("GATEWAY_DRAIN_TIMEOUT", "drain grace period elapsed")
 	// ErrConfigRejected 配置不合法（冲突、未知字段、坏版本），必须显式拒绝。
 	ErrConfigRejected = newGovError("GATEWAY_CONFIG_REJECTED", "policy configuration rejected")
 )

@@ -128,12 +128,55 @@ func (b *Breaker) toOpenLocked(now time.Time) {
 	b.probeSucceeded = 0
 }
 
+// RecordAbandon 记录一次"没有拿到下游裁决"的尝试：上游取消、预算在发起前
+// 耗尽、排空宽限期切断都属于此类——它们不证明下游故障，因此：
+//   - 绝不计入连续失败、绝不触发/重置熔断；
+//   - half-open 下回收此前 Allow 预占的探测额度，避免取消把探测槽永久吃掉。
+func (b *Breaker) RecordAbandon(now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state == StateHalfOpen && b.probeInflight > 0 {
+		b.probeInflight--
+	}
+}
+
 // State 返回当前状态（会先推进过期 open，供测试与日志解释）。
 func (b *Breaker) State(now time.Time) StateName {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.maybeTransitionLocked(now)
 	return b.state
+}
+
+// SnapshotView 是熔断器某一时刻的自洽状态快照。
+type SnapshotView struct {
+	State          StateName
+	Failures       int           // closed 期连续失败数
+	CooldownLeft   time.Duration // open 期冷却剩余时间；其他状态/已过冷却为 0
+	ProbeInflight  int           // half-open 期已发放且在途的探测额度
+	ProbeSucceeded int           // half-open 期已成功的探测数
+	HalfOpenMax    int
+}
+
+// Snapshot 返回当前状态与计数的自洽快照（先推进过期 open）。
+func (b *Breaker) Snapshot(now time.Time) SnapshotView {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.maybeTransitionLocked(now)
+	v := SnapshotView{
+		State:          b.state,
+		Failures:       b.failures,
+		ProbeInflight:  b.probeInflight,
+		ProbeSucceeded: b.probeSucceeded,
+		HalfOpenMax:    b.halfOpenMax,
+	}
+	if b.state == StateOpen {
+		left := b.cooldown - now.Sub(b.openedAt)
+		if left > 0 {
+			v.CooldownLeft = left
+		}
+	}
+	return v
 }
 
 // Key 返回维度键。

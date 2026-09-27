@@ -41,3 +41,15 @@ func (r *Registry) Snapshot(now time.Time) map[string]StateName {
 	}
 	return out
 }
+
+// SnapshotDetailed 在同一把注册表锁下复制全部熔断器快照，
+// 保证返回内容的成员集合与此刻一致，各熔断器内部字段各自自洽。
+func (r *Registry) SnapshotDetailed(now time.Time) map[string]SnapshotView {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]SnapshotView, len(r.breakers))
+	for k, b := range r.breakers {
+		out[k] = b.Snapshot(now)
+	}
+	return out
+}

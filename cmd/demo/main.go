@@ -111,6 +111,55 @@ func main() {
 	_, err = c.Invoke(context.Background(),
 		&model.Request{ID: "demo-005", Service: "shop", Method: "charge", Idempotent: true})
 	fmt.Printf("新策略下结果: %v\n", err)
+
+	section("场景6：请求进来前已取消 -> 绝不打下游；优雅排空 -> 拒绝新请求、在途跑完后干净退出")
+	preCtx, preCancel := context.WithCancel(context.Background())
+	preCancel()
+	var slowCalls int32
+	_, err = c.Invoke(preCtx,
+		&model.Request{ID: "demo-006-pre", Service: "shop", Method: "slow"})
+	fmt.Printf("预取消请求结果: %v（slow 下游调用数=%d，必须为 0）\n", err, atomic.LoadInt32(&slowCalls))
+
+	// 单独起一个客户端演示排空，避免影响上面的全局状态；给在途请求足够的自身预算。
+	drainCfg := []byte(`{
+  "version": 2,
+  "service": {
+    "name": "shop",
+    "methods": {
+      "slow": {"timeout":"2s","max_attempts":1}
+    }
+  }
+}`)
+	parsedDrain, err := config.Parse(drainCfg)
+	must(err)
+	c3, err := client.New(reg, config.NewHolder(parsedDrain), func(ctx context.Context, ins model.Instance, req *model.Request) (*model.Response, error) {
+		atomic.AddInt32(&slowCalls, 1)
+		select {
+		case <-time.After(120 * time.Millisecond):
+			return &model.Response{Status: 200, InstanceID: ins.ID}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}, client.WithLogger(os.Stdout))
+	must(err)
+	go func() {
+		_, _ = c3.Invoke(context.Background(),
+			&model.Request{ID: "demo-006-held", Service: "shop", Method: "slow"})
+	}()
+	time.Sleep(20 * time.Millisecond) // 等在途真正进入下游
+	c3.BeginDrain(2 * time.Second)
+	if _, err := c3.Invoke(context.Background(),
+		&model.Request{ID: "demo-006-new", Service: "shop", Method: "slow"}); err != nil {
+		fmt.Printf("排空期间新请求被拒绝: %v\n", err)
+	}
+	if err := c3.Shutdown(2 * time.Second); err != nil {
+		fmt.Printf("排空结果: %v\n", err)
+	} else {
+		fmt.Println("排空结果: 在途请求在预算内全部完成，进程可干净退出")
+	}
+	snap := c3.Snapshot()
+	fmt.Printf("排空后快照: phase=%s inflight=%d rejected=%d timed_out=%t\n",
+		snap.Drain.Phase, snap.Drain.Inflight, snap.Drain.Rejected, snap.Drain.TimedOut)
 }
 
 func section(title string) {

@@ -383,3 +383,74 @@ func waitUntil(timeout time.Duration, cond func() bool) {
 		time.Sleep(2 * time.Millisecond)
 	}
 }
+
+// TestCancelDuringRetryBackoffNeverCallsAgain 取消先于第一次尝试的失败结果生效：
+// 退避/下一轮入口必然观察到取消，绝不发起第二次下游调用，计数全部回落。
+func TestCancelDuringRetryBackoffNeverCallsAgain(t *testing.T) {
+	p := policyFor("m", func(p *model.MethodPolicy) {
+		p.MaxAttempts = 5
+		p.Timeout = 5 * time.Second
+	})
+	reg, holder := newHarness(t, p)
+	var calls int32
+	entered := make(chan struct{})
+	failNow := make(chan struct{})
+	inv := func(ctx context.Context, ins model.Instance, req *model.Request) (*model.Response, error) {
+		atomic.AddInt32(&calls, 1)
+		close(entered)
+		<-failNow // 由测试协调：先取消，再让第一次尝试以失败收场
+		return nil, errors.New("boom")
+	}
+	c, _ := New(reg, holder, inv)
+	registerN(reg, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, e := c.Invoke(ctx, &model.Request{ID: "r-backoff-cancel", Service: "svc", Method: "m", Idempotent: true})
+		errCh <- e
+	}()
+	<-entered
+	cancel()
+	close(failNow)
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, model.ErrContextCanceled) {
+			t.Fatalf("want GATEWAY_CANCELED, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled request did not return")
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("must not retry after cancel, calls=%d", n)
+	}
+	waitUntil(300*time.Millisecond, func() bool { return c.limiters.InFlight("svc/a#m") == 0 })
+	if snap := c.Snapshot(); snap.Drain.Inflight != 0 {
+		t.Fatalf("drain inflight must fall back to 0, got %d", snap.Drain.Inflight)
+	}
+}
+
+// TestPreCanceledRequestTouchesNothing 入口即取消：下游零调用、无限流维度残留。
+func TestPreCanceledRequestTouchesNothing(t *testing.T) {
+	p := policyFor("m", nil)
+	reg, holder := newHarness(t, p)
+	var calls int32
+	c, _ := New(reg, holder, failingInvoker(&calls))
+	registerN(reg, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := c.Invoke(ctx, &model.Request{ID: "r-pre", Service: "svc", Method: "m"})
+	if !errors.Is(err, model.ErrContextCanceled) {
+		t.Fatalf("want GATEWAY_CANCELED, got %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("no downstream call allowed, calls=%d", calls)
+	}
+	if n := c.limiters.InFlight("svc/a#m"); n != 0 {
+		t.Fatalf("no limiter state allowed, inflight=%d", n)
+	}
+	if snap := c.Snapshot(); snap.Drain.Inflight != 0 {
+		t.Fatalf("drain inflight must be 0, got %d", snap.Drain.Inflight)
+	}
+}

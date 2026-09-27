@@ -14,6 +14,7 @@ import (
 	"github.com/lechandonga/resilient-rpc-gateway-go/pkg/concurrency"
 	"github.com/lechandonga/resilient-rpc-gateway-go/pkg/config"
 	"github.com/lechandonga/resilient-rpc-gateway-go/pkg/deadline"
+	"github.com/lechandonga/resilient-rpc-gateway-go/pkg/drain"
 	"github.com/lechandonga/resilient-rpc-gateway-go/pkg/loadbalancer"
 	"github.com/lechandonga/resilient-rpc-gateway-go/pkg/model"
 	"github.com/lechandonga/resilient-rpc-gateway-go/pkg/registry"
@@ -30,6 +31,7 @@ type Client struct {
 	invoker  Invoker
 	limiters *concurrency.Limiter
 	breakers *circuitbreaker.Registry
+	drainer  *drain.Coordinator
 	tracer   *Tracer
 	now      func() time.Time
 
@@ -72,12 +74,14 @@ func New(reg *registry.Registry, holder *config.Holder, invoker Invoker, opts ..
 		invoker:  invoker,
 		limiters: concurrency.New(),
 		breakers: circuitbreaker.NewRegistry(),
+		drainer:  drain.New(),
 		tracer:   NewTracer(io.Discard, 256, false),
 		now:      time.Now,
 	}
 	for _, o := range opts {
 		o(c)
 	}
+	c.drainer = c.drainer.WithClock(c.now)
 	return c, nil
 }
 
@@ -137,14 +141,48 @@ func (c *Client) Invoke(ctx context.Context, req *model.Request) (*model.Respons
 
 	// 上游截止时间 + 方法单尝试预算：更紧者生效。
 	parentDL, _ := deadline.FromContext(ctx)
-	prop := deadline.New(parentDL, policy.Timeout)
+	prop := deadline.New(parentDL, policy.Timeout).WithClock(c.now)
 
 	resp := &model.Response{Reason: "UNKNOWN"}
 	var lastErr error
 	var exhausted bool
 
+	// 取消在整条链路上最先收敛：请求进来时已被上游取消/超预算，
+	// 立刻失败，绝不进入发现、熔断、排队，更不会敲一次下游。
+	if gerr := deadline.Classify(ctx); gerr != nil {
+		return resp, gerr
+	}
+	if left, ok := prop.Remaining(); !ok || left <= 0 {
+		return resp, model.ErrTimeout
+	}
+
+	// 排空准入：进程级排空开始后，新请求一律 GATEWAY_DRAIN_REJECTED，
+	// 不占用任何并发/排队/连接资源。
+	if err := c.drainer.Admit(); err != nil {
+		c.tracer.Emit(TraceLine{At: c.now(), RequestID: req.ID, Revision: rev,
+			Policy: "drain", Outcome: "reject", Reason: govCode(err)})
+		return resp, err
+	}
+	// 登记全局在途并取得"可被排空切断"的请求 ctx；defer Release 保证
+	// 无论从哪条路径退出（含取消/排空切断/重试耗尽），在途计数都回落。
+	handle, err := c.drainer.Bind(ctx)
+	if err != nil {
+		c.tracer.Emit(TraceLine{At: c.now(), RequestID: req.ID, Revision: rev,
+			Policy: "drain", Outcome: "reject", Reason: govCode(err)})
+		return resp, err
+	}
+	defer handle.Release()
+	ctx = handle.Context()
+
 	for attempt := 1; attempt <= rstate.MaxAttempts(); attempt++ {
 		now = c.now()
+		// 每轮入口都检查：等退避、等排队、上一轮处理期间发生的取消/超预算，
+		// 都不会再发起新的下游尝试，也不会被后续重试绕过去。
+		if gerr := deadline.Classify(ctx); gerr != nil {
+			c.tracer.Emit(TraceLine{At: now, RequestID: req.ID, Revision: rev, Attempt: attempt,
+				Policy: "lifecycle", Outcome: "reject", Reason: govCode(gerr)})
+			return resp, gerr
+		}
 		if err := rstate.Allow(req, attempt); err != nil {
 			// 非幂等请求尝试重试：直接给出可区分原因。
 			c.tracer.Emit(TraceLine{At: c.now(), RequestID: req.ID, Revision: rev, Attempt: attempt,
@@ -164,12 +202,32 @@ func (c *Client) Invoke(ctx context.Context, req *model.Request) (*model.Respons
 			return resp, reason
 		}
 
-		ins, err := lb.Pick(candidates)
+		// 选出一个未在排空的实例：被摘除排空的实例本轮不接受新流量，
+		// 但它的在途请求仍在各自预算内继续。先过滤再 Pick，负载均衡游标只推进一次。
+		eligible := candidates[:0:0]
+		for _, cand := range candidates {
+			if !c.drainer.IsInstanceDraining(req.Service, cand.ID) {
+				eligible = append(eligible, cand)
+			}
+		}
+		if len(eligible) == 0 {
+			// 全部实例都在排空中：等价于"此刻没有健康可接流量的实例"。
+			c.tracer.Emit(TraceLine{At: now, RequestID: req.ID, Revision: rev, Attempt: attempt,
+				Policy: "drain", Outcome: "reject", Reason: model.ErrNoHealthyInstance.Code})
+			return resp, model.ErrNoHealthyInstance
+		}
+		ins, err := lb.Pick(eligible)
 		if err != nil {
 			return resp, err
 		}
+		// 防御性二次确认：即使并发下实例恰好在选中后进入排空，也不在此发起调用。
+		if err := handle.Attach(req.Service, ins.ID); err != nil {
+			c.tracer.Emit(TraceLine{At: now, RequestID: req.ID, Revision: rev, Attempt: attempt,
+				InstanceID: ins.ID, Policy: "drain", Outcome: "reject", Reason: govCode(err)})
+			return resp, model.ErrDrainRejected
+		}
 
-		cbKey := ins.ID + "#" + req.Method
+		cbKey := cbDimension(req.Service, ins.ID, req.Method)
 		brk := c.breakers.Get(cbKey, policy)
 		if err := brk.Allow(now); err != nil {
 			c.tracer.Emit(TraceLine{At: c.now(), RequestID: req.ID, Revision: rev, Attempt: attempt,
@@ -186,14 +244,20 @@ func (c *Client) Invoke(ctx context.Context, req *model.Request) (*model.Respons
 		}
 
 		// 单实例×方法维度的并发额度。
-		limitKey := ins.ID + "#" + req.Method
+		limitKey := cbDimension(req.Service, ins.ID, req.Method)
 		ticket, err := c.limiters.Acquire(ctx, limitKey, policy)
 		if err != nil {
 			c.tracer.Emit(TraceLine{At: c.now(), RequestID: req.ID, Revision: rev, Attempt: attempt,
 				InstanceID: ins.ID, Policy: "concurrency", Outcome: "reject", Reason: govCode(err)})
+			// 取消/超预算/排空：终态，绝不重试；回收半开探测槽，不留下任何占用。
+			if isTerminalContextErr(err) {
+				brk.RecordAbandon(now)
+				return resp, err
+			}
 			lastErr = err
 			if attempt < rstate.MaxAttempts() {
 				if werr := c.waitRetryBudget(ctx, rstate, attempt, prop, rev, req.ID); werr != nil {
+					brk.RecordAbandon(now)
 					return resp, werr
 				}
 			}
@@ -203,6 +267,17 @@ func (c *Client) Invoke(ctx context.Context, req *model.Request) (*model.Respons
 		outcome, callErr := c.doCall(ctx, prop, req, ins, ticket, rev, attempt)
 		resp.Attempts = attempt
 		now = c.now()
+
+		// 熔断记账铁律：只有拿到下游业务裁决才 RecordResult；
+		// 取消/超预算/排空（无论发生在发起前、排队后还是在途中）一律 RecordAbandon：
+		// 不计失败、不触发熔断，并回收 half-open 预占的探测槽。
+		if gerr := asAbandon(callErr); gerr != nil {
+			brk.RecordAbandon(now)
+			c.tracer.Emit(TraceLine{At: now, RequestID: req.ID, Revision: rev, Attempt: attempt,
+				InstanceID: ins.ID, Policy: "lifecycle", Outcome: "reject",
+				Reason: govCode(gerr)})
+			return resp, gerr
+		}
 		brk.RecordResult(now, callErr == nil)
 
 		if callErr == nil {
@@ -220,15 +295,12 @@ func (c *Client) Invoke(ctx context.Context, req *model.Request) (*model.Respons
 			Reason: govCode(callErr)})
 		lastErr = callErr
 
-		// 上游取消或预算超时都不可重试：剩余空间已不存在，重试只会浪费资源。
-		if errors.Is(callErr, model.ErrContextCanceled) || errors.Is(callErr, model.ErrTimeout) {
-			return resp, callErr
-		}
 		if attempt == rstate.MaxAttempts() {
 			exhausted = true
 			break
 		}
 		if werr := c.waitRetryBudget(ctx, rstate, attempt, prop, rev, req.ID); werr != nil {
+			brk.RecordAbandon(now)
 			return resp, werr
 		}
 	}
@@ -240,14 +312,49 @@ func (c *Client) Invoke(ctx context.Context, req *model.Request) (*model.Respons
 	return resp, lastErr
 }
 
+// cbDimension 构造治理维度键：service/instance#method。
+// 同 ID 跨服务实例不会互相污染熔断与并发计数。
+func cbDimension(service, instanceID, method string) string {
+	return service + "/" + instanceID + "#" + method
+}
+
+// isTerminalContextErr 判断是否为不可重试的链路终止错误。
+func isTerminalContextErr(err error) bool {
+	return errors.Is(err, model.ErrContextCanceled) ||
+		errors.Is(err, model.ErrTimeout) ||
+		errors.Is(err, model.ErrDrainTimeout) ||
+		errors.Is(err, model.ErrDrainRejected)
+}
+
+// asAbandon 把"未触达下游"的错误映射为熔断放弃原因；普通下游错误返回 nil。
+func asAbandon(err error) error {
+	switch {
+	case errors.Is(err, model.ErrContextCanceled),
+		errors.Is(err, model.ErrTimeout),
+		errors.Is(err, model.ErrDrainTimeout):
+		return err
+	}
+	return nil
+}
+
 // doCall 执行单次下游调用，保证结束时释放预算与并发额度。
+// 返回错误中的取消/超时/排空类（asAbandon 可识别）表示没有可用的下游业务裁决，
+// 无论 invoker goroutine 是否已启动，调用方都按"放弃"记账，绝不计失败、不重试。
 func (c *Client) doCall(parent context.Context, prop *deadline.Propagation,
 	req *model.Request, ins model.Instance, ticket *concurrency.Ticket,
-	rev uint64, attempt int) (*model.Response, error) {
+	rev uint64, attempt int) (resp *model.Response, err error) {
 
 	childCtx, cancel, budget := prop.ChildContext(parent)
 	defer cancel()
 	defer ticket.Release()
+
+	// 拿到额度后、真正发起前再检查一次：排队等待期间可能已被取消或切断。
+	if gerr := deadline.Classify(parent); gerr != nil {
+		return nil, gerr
+	}
+	if gerr := deadline.Classify(childCtx); gerr != nil {
+		return nil, gerr
+	}
 
 	if budget <= 0 {
 		// 剩余预算为零：不占用下游连接，直接失败。
@@ -277,8 +384,8 @@ func (c *Client) doCall(parent context.Context, prop *deadline.Propagation,
 		}
 		return res.resp, nil
 	case <-parent.Done():
-		// 上游取消 / 截止：不等待慢下游，goroutine 会经由 childCtx 被驱动退出；
-		// 立刻释放额度，不留下仍在推进的占用。
+		// 上游取消 / 截止 / 排空切断：不等待慢下游，goroutine 经由 childCtx
+		// （parent 取消会级联）被驱动退出；立刻释放额度，不留下仍在推进的占用。
 		return nil, deadline.Classify(parent)
 	case <-childCtx.Done():
 		return nil, deadline.Classify(childCtx)

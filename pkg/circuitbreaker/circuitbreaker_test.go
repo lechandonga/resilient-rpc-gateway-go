@@ -95,3 +95,50 @@ func TestHalfOpenProbeQuotaLimited(t *testing.T) {
 		t.Fatalf("second probe must be rejected while first in flight, got %v", err)
 	}
 }
+
+// TestHalfOpenProbeAbandonedIsRecovered 半开探测在拿到下游裁决前被取消/排空：
+// 探测槽必须回收，下一个 Allow 仍能放一个探测；且不计失败、不退回 open。
+func TestHalfOpenProbeAbandonedIsRecovered(t *testing.T) {
+	t0 := time.Unix(5000, 0)
+	b := New("a#m", cbPolicy())
+	for i := 0; i < 3; i++ {
+		b.RecordResult(t0, false)
+	}
+	t1 := t0.Add(10 * time.Millisecond)
+	if err := b.Allow(t1); err != nil {
+		t.Fatal(err)
+	}
+	// 探测未触达下游就被放弃。
+	b.RecordAbandon(t1.Add(time.Millisecond))
+	v := b.Snapshot(t1.Add(time.Millisecond))
+	if v.State != StateHalfOpen {
+		t.Fatalf("abandon must keep half-open, got %s", v.State)
+	}
+	if v.ProbeInflight != 0 {
+		t.Fatalf("probe slot must be recovered, inflight=%d", v.ProbeInflight)
+	}
+	// 放弃后探测槽可再次发放。
+	if err := b.Allow(t1.Add(2 * time.Millisecond)); err != nil {
+		t.Fatalf("recovered probe slot must allow a new probe, got %v", err)
+	}
+}
+
+// TestAbandonInClosedDoesNotCountFailure closed 期取消不计连续失败。
+func TestAbandonInClosedDoesNotCountFailure(t *testing.T) {
+	t0 := time.Unix(6000, 0)
+	b := New("a#m", cbPolicy())
+	b.RecordResult(t0, false)
+	b.RecordResult(t0, false) // 连续失败 2，再差 1 次就 open
+	b.RecordAbandon(t0)       // 取消不算失败
+	if b.State(t0) != StateClosed {
+		t.Fatalf("abandon must not trip breaker, got %s", b.State(t0))
+	}
+	if v := b.Snapshot(t0); v.Failures != 2 {
+		t.Fatalf("failures must stay 2, got %d", v.Failures)
+	}
+	// 再来一次真实失败才打开。
+	b.RecordResult(t0, false)
+	if b.State(t0) != StateOpen {
+		t.Fatalf("real failure after 2 prior must open, got %s", b.State(t0))
+	}
+}

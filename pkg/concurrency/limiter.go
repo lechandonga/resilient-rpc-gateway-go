@@ -4,6 +4,7 @@ package concurrency
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/lechandonga/resilient-rpc-gateway-go/pkg/model"
@@ -14,8 +15,10 @@ type waiter struct {
 }
 
 type state struct {
-	active int
-	queue  []*waiter
+	active   int
+	queue    []*waiter
+	max      int
+	maxQueue int
 }
 
 // Limiter 按维度持有额度；所有 map 与切片均有界。
@@ -51,9 +54,12 @@ func (l *Limiter) Acquire(ctx context.Context, key string, policy model.MethodPo
 	l.mu.Lock()
 	s := l.states[key]
 	if s == nil {
-		s = &state{}
+		s = &state{max: max, maxQueue: policy.MaxQueue}
 		l.states[key] = s
 	}
+	// 热更新后额度可能变化：以最新策略为准（只影响后续决策，不抢占已发放令牌）。
+	s.max = max
+	s.maxQueue = policy.MaxQueue
 	if s.active < max {
 		s.active++
 		l.mu.Unlock()
@@ -139,7 +145,59 @@ func (l *Limiter) InFlight(key string) int {
 	return s.active + len(s.queue)
 }
 
+// KeyState 是某一并发维度在某一时刻的自洽计数快照。
+type KeyState struct {
+	Key        string
+	Active     int // 正在向下游发起调用的占用数（恒 <= MaxConcurrency）
+	Waiting    int // 排队等待额度的请求数（恒 <= MaxQueue）
+	MaxActive  int // 当前生效的执行额度上限
+	MaxWaiting int // 当前生效的排队上限（0 表示不允许排队）
+}
+
+// InFlightN 同 InFlight 并额外返回排队数，便于调用方对账（在途=执行+排队）。
+func (l *Limiter) InFlightN(key string) (active, waiting int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	s := l.states[key]
+	if s == nil {
+		return 0, 0
+	}
+	return s.active, len(s.queue)
+}
+
+// Snapshot 一次性复制全部非空闲维度的计数；在互斥锁内完成读取，
+// 因此返回的各维度数字是同一把锁下的自洽值。
+func (l *Limiter) Snapshot() []KeyState {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]KeyState, 0, len(l.states))
+	for k, s := range l.states {
+		out = append(out, KeyState{
+			Key:        k,
+			Active:     s.active,
+			Waiting:    len(s.queue),
+			MaxActive:  s.max,
+			MaxWaiting: s.maxQueue,
+		})
+	}
+	return out
+}
+
 func mapCtxErr(ctx context.Context) error {
+	// 先看 cause：排空切断等原因经 WithCancelCause 传播，
+	// 表面 ctx.Err() 可能只是 Canceled。
+	if cause := context.Cause(ctx); cause != nil {
+		switch {
+		case errors.Is(cause, model.ErrDrainTimeout):
+			return model.ErrDrainTimeout
+		case errors.Is(cause, model.ErrDrainRejected):
+			return model.ErrDrainRejected
+		case errors.Is(cause, model.ErrTimeout):
+			return model.ErrTimeout
+		case errors.Is(cause, model.ErrContextCanceled):
+			return model.ErrContextCanceled
+		}
+	}
 	if ctx.Err() == context.DeadlineExceeded {
 		return model.ErrTimeout
 	}

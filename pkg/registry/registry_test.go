@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -75,23 +76,24 @@ func TestHealthCheckerMarksDownAndRecovers(t *testing.T) {
 	r := NewRegistry()
 	r.Upsert("svc", model.Instance{ID: "a", Address: "addr"})
 
-	var healthy = true
+	var healthy atomic.Bool
+	healthy.Store(true)
 
 	// failThreshold=2：第一次失败不摘，第二次摘
 	hc := NewHealthChecker(r, time.Millisecond, 50*time.Millisecond, 2,
-		makeProbe(func() bool { return healthy }))
+		makeProbe(func() bool { return healthy.Load() }))
 	ctx, stop := contextBg()
 	defer stop()
 	hc.Start(ctx)
 	defer hc.Stop()
 
-	healthy = false
+	healthy.Store(false)
 	waitUntil(time.Second, func() bool { return len(r.ListHealthy("svc")) == 0 })
 	if len(r.ListHealthy("svc")) != 0 {
 		t.Fatal("instance should be marked unhealthy after consecutive probe failures")
 	}
 
-	healthy = true
+	healthy.Store(true)
 	waitUntil(time.Second, func() bool { return len(r.ListHealthy("svc")) == 1 })
 	if len(r.ListHealthy("svc")) != 1 {
 		t.Fatal("instance should recover after probe succeeds")
