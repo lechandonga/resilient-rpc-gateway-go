@@ -65,8 +65,14 @@ func (p *Propagation) ChildContext(parent context.Context) (context.Context, con
 }
 
 // Classify 把 context 的结束原因映射为可区分的治理错误：
-// 上游主动取消 -> ErrContextCanceled；预算到期 -> ErrTimeout。
+// 上游主动取消 -> ErrContextCanceled；预算到期 -> ErrTimeout；
+// 排空宽限到期（以 cause 形式沿上下文链传播）-> ErrDrainTimeout。
 func Classify(ctx context.Context) error {
+	// 排空宽限到期通过 context.WithCancelCause 传播，优先级最高：
+	// 即使结束形式是 deadline exceeded，也要能与普通预算耗尽区分开。
+	if errors.Is(context.Cause(ctx), model.ErrDrainTimeout) {
+		return model.ErrDrainTimeout
+	}
 	switch {
 	case errors.Is(ctx.Err(), context.Canceled):
 		return model.ErrContextCanceled

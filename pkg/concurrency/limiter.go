@@ -4,6 +4,9 @@ package concurrency
 
 import (
 	"context"
+	"errors"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/lechandonga/resilient-rpc-gateway-go/pkg/model"
@@ -14,8 +17,40 @@ type waiter struct {
 }
 
 type state struct {
-	active int
-	queue  []*waiter
+	active   int
+	queue    []*waiter
+	max      int
+	maxQueue int
+}
+
+// Snapshot 返回所有非空闲维度的额度统计，按 key 排序。
+// 一次加锁拷贝，数值彼此自洽（active+queue 即此刻在途）。
+func (l *Limiter) Snapshot() []model.LimiterStat {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	keys := make([]string, 0, len(l.states))
+	for k := range l.states {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]model.LimiterStat, 0, len(keys))
+	for _, k := range keys {
+		s := l.states[k]
+		ins, method := k, ""
+		if i := strings.IndexByte(k, '#'); i >= 0 {
+			ins, method = k[:i], k[i+1:]
+		}
+		out = append(out, model.LimiterStat{
+			Key:            k,
+			InstanceID:     ins,
+			Method:         method,
+			Active:         s.active,
+			Queued:         len(s.queue),
+			MaxConcurrency: s.max,
+			MaxQueue:       s.maxQueue,
+		})
+	}
+	return out
 }
 
 // Limiter 按维度持有额度；所有 map 与切片均有界。
@@ -51,7 +86,7 @@ func (l *Limiter) Acquire(ctx context.Context, key string, policy model.MethodPo
 	l.mu.Lock()
 	s := l.states[key]
 	if s == nil {
-		s = &state{}
+		s = &state{max: max, maxQueue: policy.MaxQueue}
 		l.states[key] = s
 	}
 	if s.active < max {
@@ -140,6 +175,10 @@ func (l *Limiter) InFlight(key string) int {
 }
 
 func mapCtxErr(ctx context.Context) error {
+	// 排空宽限到期以 cancel cause 传播，需与普通取消/超时区分。
+	if errors.Is(context.Cause(ctx), model.ErrDrainTimeout) {
+		return model.ErrDrainTimeout
+	}
 	if ctx.Err() == context.DeadlineExceeded {
 		return model.ErrTimeout
 	}

@@ -2,6 +2,7 @@
 package registry
 
 import (
+	"sort"
 	"sync"
 
 	"github.com/lechandonga/resilient-rpc-gateway-go/pkg/model"
@@ -58,11 +59,13 @@ func (r *Registry) Upsert(service string, ins ...model.Instance) {
 			in.Weight = 1
 		}
 		if _, ok := s.instances[in.ID]; ok {
-			// 显式 upsert 视为重新上线：恢复健康，且始终发布变更。
+			// 显式 upsert 视为重新上线：恢复健康、清除排空标记，且始终发布变更。
 			in.Healthy = true
+			in.Draining = false
 			changed = true
 		} else {
 			in.Healthy = true
+			in.Draining = false
 			changed = true
 		}
 		s.instances[in.ID] = in
@@ -70,6 +73,42 @@ func (r *Registry) Upsert(service string, ins ...model.Instance) {
 	if changed {
 		r.bumpLocked(s)
 	}
+}
+
+// Drain 标记实例进入优雅排空（摘除）：实例保留在注册中心，在途请求可继续跑完，
+// 但 ListHealthy 不再返回它，因此不会有新请求选中该实例。
+// 排空结束后由 Remove 彻底摘除；重复调用幂等。
+func (r *Registry) Drain(service, instanceID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.svcs[service]
+	if !ok {
+		return
+	}
+	in, ok := s.instances[instanceID]
+	if !ok || in.Draining {
+		return
+	}
+	in.Draining = true
+	s.instances[instanceID] = in
+	r.bumpLocked(s)
+}
+
+// Undrain 取消排空标记（摘除回滚，例如实例重新上线）。
+func (r *Registry) Undrain(service, instanceID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.svcs[service]
+	if !ok {
+		return
+	}
+	in, ok := s.instances[instanceID]
+	if !ok || !in.Draining {
+		return
+	}
+	in.Draining = false
+	s.instances[instanceID] = in
+	r.bumpLocked(s)
 }
 
 // Remove 摘除实例（下线）。流量不得再命中被摘除实例。
@@ -158,7 +197,7 @@ func (r *Registry) ListHealthy(service string) []model.Instance {
 	}
 	out := make([]model.Instance, 0, len(s.instances))
 	for _, in := range s.instances {
-		if in.Healthy {
+		if in.Healthy && !in.Draining {
 			out = append(out, in)
 		}
 	}
@@ -216,6 +255,38 @@ func nextSubID() uint64 {
 	defer subCounter.Unlock()
 	subCounter.n++
 	return subCounter.n
+}
+
+// Stats 返回所有实例的统计快照（含不健康、排空中），
+// 按 service、实例 ID 排序，保证重复查询结果可复现。
+func (r *Registry) Stats() []model.InstanceStat {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	services := make([]string, 0, len(r.svcs))
+	for name := range r.svcs {
+		services = append(services, name)
+	}
+	sort.Strings(services)
+	var out []model.InstanceStat
+	for _, svc := range services {
+		ids := make([]string, 0, len(r.svcs[svc].instances))
+		for id := range r.svcs[svc].instances {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			in := r.svcs[svc].instances[id]
+			out = append(out, model.InstanceStat{
+				Service:  svc,
+				ID:       in.ID,
+				Address:  in.Address,
+				Weight:   in.Weight,
+				Healthy:  in.Healthy,
+				Draining: in.Draining,
+			})
+		}
+	}
+	return out
 }
 
 // Services 返回当前注册过的全部服务名。

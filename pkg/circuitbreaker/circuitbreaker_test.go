@@ -95,3 +95,54 @@ func TestHalfOpenProbeQuotaLimited(t *testing.T) {
 		t.Fatalf("second probe must be rejected while first in flight, got %v", err)
 	}
 }
+
+func TestRecordAbandonReturnsHalfOpenSlot(t *testing.T) {
+	t0 := time.Unix(5000, 0)
+	b := New("a#m", cbPolicy()) // threshold=3, cooldown=10ms, probes=1
+	for i := 0; i < 3; i++ {
+		b.RecordResult(t0, false)
+	}
+	t1 := t0.Add(10 * time.Millisecond)
+	if err := b.Allow(t1); err != nil {
+		t.Fatal(err)
+	}
+	// 探测名额已占用：第二个请求被拒
+	if err := b.Allow(t1); !errors.Is(err, model.ErrCircuitOpen) {
+		t.Fatalf("probe slot exhausted, got %v", err)
+	}
+	// 请求在打下游前被取消 -> 放弃探测，名额归还，状态不变
+	b.RecordAbandon(t1)
+	if b.State(t1) != StateHalfOpen {
+		t.Fatalf("abandon must keep half-open, got %s", b.State(t1))
+	}
+	if err := b.Allow(t1.Add(time.Millisecond)); err != nil {
+		t.Fatalf("abandoned slot must be reusable: %v", err)
+	}
+}
+
+func TestRecordAbandonInClosedIsNoop(t *testing.T) {
+	t0 := time.Unix(6000, 0)
+	b := New("a#m", cbPolicy())
+	b.RecordAbandon(t0)
+	if err := b.Allow(t0); err != nil {
+		t.Fatalf("closed breaker unaffected by abandon: %v", err)
+	}
+}
+
+func TestStatReportsStateAndCooldownLeft(t *testing.T) {
+	t0 := time.Unix(7000, 0)
+	b := New("a#m", cbPolicy())
+	for i := 0; i < 3; i++ {
+		b.RecordResult(t0, false)
+	}
+	st := b.Stat(t0.Add(4 * time.Millisecond))
+	if st.State != string(StateOpen) || st.InstanceID != "a" || st.Method != "m" {
+		t.Fatalf("bad stat: %+v", st)
+	}
+	if st.CooldownLeft <= 0 || st.CooldownLeft > 10*time.Millisecond {
+		t.Fatalf("cooldown left out of range: %v", st.CooldownLeft)
+	}
+	if st.Failures != 3 {
+		t.Fatalf("failures=%d", st.Failures)
+	}
+}

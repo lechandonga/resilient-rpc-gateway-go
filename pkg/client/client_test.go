@@ -383,3 +383,216 @@ func waitUntil(timeout time.Duration, cond func() bool) {
 		time.Sleep(2 * time.Millisecond)
 	}
 }
+
+// TestSnapshotConsistencyUnderLoad 并发请求期间，快照必须自洽：
+// TotalInFlight 等于排空计数；sum(active+queued) 不超过 TotalInFlight；
+// 每个 limiter 维度 active<=max、queued<=maxQueue；空闲后全部归零。
+func TestSnapshotConsistencyUnderLoad(t *testing.T) {
+	p := policyFor("m", func(p *model.MethodPolicy) {
+		p.MaxConcurrency = 2
+		p.MaxQueue = 4
+		p.OnLimit = model.RejectWait
+		p.Timeout = 5 * time.Second
+	})
+	reg, holder := newHarness(t, p)
+	registerN(reg, 2)
+
+	entered := make(chan struct{}, 8)
+	release := make(chan struct{})
+	inv := func(ctx context.Context, ins model.Instance, req *model.Request) (*model.Response, error) {
+		entered <- struct{}{}
+		select {
+		case <-release:
+			return &model.Response{Status: 200, InstanceID: ins.ID}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	c, _ := New(reg, holder, inv)
+
+	const n = 8
+	errCh := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			_, err := c.Invoke(context.Background(),
+				&model.Request{ID: "snap-" + string(rune('a'+i)), Service: "svc", Method: "m"})
+			errCh <- err
+		}(i)
+	}
+	// 等 4 个进入下游（2 实例 × 2 并发），其余在排队
+	for i := 0; i < 4; i++ {
+		<-entered
+	}
+	// 等全部 8 个请求都已被治理层受理（在途或排队中）
+	waitUntil(time.Second, func() bool { return c.Snapshot().TotalInFlight == n })
+
+	// 负载期连续取多次快照，每次都必须自洽
+	for k := 0; k < 50; k++ {
+		s := c.Snapshot()
+		var activeSum, queuedSum int
+		for _, l := range s.Limiters {
+			if l.Active < 0 || l.Queued < 0 {
+				t.Fatalf("negative counts: %+v", l)
+			}
+			if l.Active > l.MaxConcurrency || l.Queued > l.MaxQueue {
+				t.Fatalf("bounds violated: %+v", l)
+			}
+			activeSum += l.Active
+			queuedSum += l.Queued
+		}
+		// 在途总数 == 排空记账；额度侧 active+queue 是其子集
+		// （差额为尚未走到额度阶段的请求，非负）。
+		if s.TotalInFlight != s.Drain.InFlight {
+			t.Fatalf("total inflight must equal drain count: %+v", s.Drain)
+		}
+		if activeSum+queuedSum > s.TotalInFlight {
+			t.Fatalf("limiter sum %d exceeds total inflight %d", activeSum+queuedSum, s.TotalInFlight)
+		}
+		if s.TotalInFlight != n {
+			// 此刻所有请求都应已受理且未释放
+			t.Fatalf("want %d inflight, got %d", n, s.TotalInFlight)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// 重复查询的稳定键顺序可复现：两次快照 breaker/limiter/instance 键序列一致
+	keySeq := func(s model.GovernanceSnapshot) string {
+		out := ""
+		for _, l := range s.Limiters {
+			out += l.Key + ","
+		}
+		out += "|"
+		for _, b := range s.Breakers {
+			out += b.Key + ","
+		}
+		return out
+	}
+	if a, b := keySeq(c.Snapshot()), keySeq(c.Snapshot()); a != b {
+		t.Fatalf("snapshot key order not reproducible:\n%s\n%s", a, b)
+	}
+
+	close(release)
+	for i := 0; i < n; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("all requests should finish: %v", err)
+		}
+	}
+	waitUntil(time.Second, func() bool {
+		s := c.Snapshot()
+		return s.TotalInFlight == 0 && s.Drain.InFlight == 0 && len(s.Limiters) == 0
+	})
+}
+
+// TestCancelDuringRetryBackoffSkipsFurtherAttempts 第 1 次尝试失败后，
+// 在退避期间上游取消：绝不能再发起第 2 次下游调用。
+func TestCancelDuringRetryBackoffSkipsFurtherAttempts(t *testing.T) {
+	p := policyFor("pay", func(p *model.MethodPolicy) {
+		p.MaxAttempts = 5
+		p.Timeout = 5 * time.Second
+		// 拉长基础退避：保证取消发生在退避窗口内
+	})
+	reg, holder := newHarness(t, p)
+	var calls int32
+	c, _ := New(reg, holder, func(ctx context.Context, ins model.Instance, req *model.Request) (*model.Response, error) {
+		atomic.AddInt32(&calls, 1)
+		return nil, errors.New("boom")
+	})
+	registerN(reg, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := c.Invoke(ctx,
+			&model.Request{ID: "r-backoff-cancel", Service: "svc", Method: "pay", Idempotent: true})
+		errCh <- err
+	}()
+	waitUntil(time.Second, func() bool { return atomic.LoadInt32(&calls) == 1 })
+	cancel() // 在第一次失败后的退避中取消
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, model.ErrContextCanceled) {
+			t.Fatalf("want ErrContextCanceled, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("request did not return after cancel")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("cancel during backoff must not trigger further attempts, calls=%d", got)
+	}
+	if s := c.Snapshot(); s.TotalInFlight != 0 {
+		t.Fatalf("inflight must settle to 0, got %d", s.TotalInFlight)
+	}
+}
+
+// TestCanceledHalfOpenProbeReleasesSlot 半开探测在打下游中被取消，
+// 探测名额必须归还，后续请求仍能重新探测并成功闭合熔断。
+func TestCanceledHalfOpenProbeReleasesSlot(t *testing.T) {
+	p := policyFor("m", func(p *model.MethodPolicy) {
+		p.MaxAttempts = 1
+		p.CircuitThreshold = 1
+		p.OpenCooldown = 20 * time.Millisecond
+		p.HalfOpenProbes = 1
+		p.Timeout = 5 * time.Second
+	})
+	reg, holder := newHarness(t, p)
+	var calls int32
+	stageCh := make(chan struct{}, 1)
+	inv := func(ctx context.Context, ins model.Instance, req *model.Request) (*model.Response, error) {
+		n := atomic.AddInt32(&calls, 1)
+		switch n {
+		case 1:
+			return nil, errors.New("open it")
+		case 2:
+			stageCh <- struct{}{}
+			<-ctx.Done() // 探测被取消
+			return nil, ctx.Err()
+		default:
+			return &model.Response{Status: 200, InstanceID: ins.ID}, nil
+		}
+	}
+	c, _ := New(reg, holder, inv)
+	registerN(reg, 1)
+	// 先打熔（阈值 1）
+	_, _ = c.Invoke(context.Background(),
+		&model.Request{ID: "r-open", Service: "svc", Method: "m"})
+	if got := c.Snapshot().Breakers; len(got) == 0 || got[0].State != "open" {
+		t.Fatalf("breaker should be open: %+v", got)
+	}
+	// 冷却后探测在下游途中被取消 -> 名额归还，熔断保持 half-open
+	time.Sleep(40 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := c.Invoke(ctx,
+			&model.Request{ID: "r-probe-cancel", Service: "svc", Method: "m"})
+		errCh <- err
+	}()
+	<-stageCh
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, model.ErrContextCanceled) {
+			t.Fatalf("want canceled, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("probe request did not return")
+	}
+	st := c.Snapshot().Breakers
+	if len(st) != 1 || st[0].State != "half-open" || st[0].ProbeInflight != 0 {
+		t.Fatalf("abandoned probe must release slot and stay half-open: %+v", st)
+	}
+	// 名额泄漏会导致这个请求被永远拒绝；名额归还后它能重新探测并成功闭合
+	resp, err := c.Invoke(context.Background(),
+		&model.Request{ID: "r-probe-retry", Service: "svc", Method: "m"})
+	if err != nil {
+		t.Fatalf("re-probe after abandon should succeed: %v", err)
+	}
+	if resp.Status != 200 {
+		t.Fatalf("want 200, got %d", resp.Status)
+	}
+	waitUntil(time.Second, func() bool {
+		bs := c.Snapshot().Breakers
+		return len(bs) == 1 && bs[0].State == "closed"
+	})
+}

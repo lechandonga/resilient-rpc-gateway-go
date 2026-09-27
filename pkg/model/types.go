@@ -22,6 +22,10 @@ var (
 	ErrConcurrencyLimited = newGovError("GATEWAY_CONCURRENCY_LIMITED", "concurrency limit exceeded")
 	// ErrQueueFull 等待队列已满。
 	ErrQueueFull = newGovError("GATEWAY_QUEUE_FULL", "pending queue is full")
+	// ErrDraining 治理层（或目标实例）正在优雅排空，新请求被拒绝。
+	ErrDraining = newGovError("GATEWAY_DRAINING", "gateway is draining and rejects new requests")
+	// ErrDrainTimeout 排空宽限时间到期，在途请求被强制快速失败。
+	ErrDrainTimeout = newGovError("GATEWAY_DRAIN_TIMEOUT", "drain grace period elapsed")
 	// ErrConfigRejected 配置不合法（冲突、未知字段、坏版本），必须显式拒绝。
 	ErrConfigRejected = newGovError("GATEWAY_CONFIG_REJECTED", "policy configuration rejected")
 )
@@ -32,6 +36,7 @@ type Instance struct {
 	Address  string
 	Weight   int
 	Healthy  bool
+	Draining bool // 摘牌排空中：不再被新请求选中，在途请求继续跑完
 	Metadata map[string]string
 }
 

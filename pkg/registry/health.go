@@ -79,6 +79,10 @@ func (h *HealthChecker) round(ctx context.Context, fails map[string]int) {
 	// 因此由注册表暴露 Services）。
 	for _, svc := range h.reg.Services() {
 		for _, in := range h.reg.List(svc) {
+			// 排空中的实例是运维主动摘除，不参与健康判定，避免探测把其状态改来改去。
+			if in.Draining {
+				continue
+			}
 			key := svc + "/" + in.ID
 			probeCtx, cancel := context.WithTimeout(ctx, h.probeTimeout)
 			err := h.probe(probeCtx, in.ID, in.Address)

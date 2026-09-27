@@ -1,5 +1,5 @@
 // Command demo 在本地进程内演示治理层的确定性与可解释行为：
-// 实例抖动、下游超时、幂等重试、熔断、并发上限与配置热更新。
+// 实例抖动、下游超时、幂等重试、熔断、并发上限、配置热更新与优雅排空。
 //
 // 运行： go run ./cmd/demo
 package main
@@ -111,6 +111,63 @@ func main() {
 	_, err = c.Invoke(context.Background(),
 		&model.Request{ID: "demo-005", Service: "shop", Method: "charge", Idempotent: true})
 	fmt.Printf("新策略下结果: %v\n", err)
+
+	section("场景6：优雅排空——在途请求跑完，新请求被拒，宽限到期快速失败")
+	// 起一个需要 120ms 的在途请求；slow 方法 timeout=80ms，先把它换成一个尊重 ctx 的慢处理。
+	var slowInflight int32
+	slowInvoker := func(ctx context.Context, ins model.Instance, req *model.Request) (*model.Response, error) {
+		if req.ID == "demo-006" || req.ID == "demo-007" {
+			atomic.AddInt32(&slowInflight, 1)
+			select {
+			case <-time.After(120 * time.Millisecond):
+				return &model.Response{Status: 200, InstanceID: ins.ID}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return invoker(ctx, ins, req)
+	}
+	cd, err := client.New(reg, holder, slowInvoker)
+	must(err)
+	inflightErr := make(chan error, 1)
+	go func() {
+		_, e := cd.Invoke(context.Background(),
+			&model.Request{ID: "demo-006", Service: "shop", Method: "charge"})
+		inflightErr <- e
+	}()
+	time.Sleep(20 * time.Millisecond) // 等在途请求进入下游
+
+	// 给 200ms 宽限：在途请求能在宽限内跑完 -> 干净完成
+	snap := cd.Shutdown(200 * time.Millisecond)
+	fmt.Printf("第一次排空: phase=%s timed_out=%v inflight=%d\n",
+		snap.Phase, snap.TimedOut, snap.InFlight)
+	if err := <-inflightErr; err != nil {
+		fmt.Printf("在途请求结果（预期成功）: %v\n", err)
+	} else {
+		fmt.Println("在途请求在宽限内成功完成")
+	}
+
+	// 再来一次：宽限只有 30ms，在途跑不完 -> GATEWAY_DRAIN_TIMEOUT
+	cd2, err := client.New(reg, holder, slowInvoker)
+	must(err)
+	inflightErr2 := make(chan error, 1)
+	go func() {
+		_, e := cd2.Invoke(context.Background(),
+			&model.Request{ID: "demo-007", Service: "shop", Method: "charge"})
+		inflightErr2 <- e
+	}()
+	time.Sleep(20 * time.Millisecond)
+	snap = cd2.Shutdown(30 * time.Millisecond)
+	fmt.Printf("第二次排空: phase=%s timed_out=%v\n", snap.Phase, snap.TimedOut)
+	fmt.Printf("在途请求结果（预期 GATEWAY_DRAIN_TIMEOUT）: %v\n", <-inflightErr2)
+	// 排空中/后新请求一律被明确拒绝
+	_, err = cd2.Invoke(context.Background(),
+		&model.Request{ID: "demo-008", Service: "shop", Method: "charge"})
+	fmt.Printf("排空后新请求结果（预期 GATEWAY_DRAINING）: %v\n", err)
+	if n := atomic.LoadInt32(&slowInflight); n != 2 {
+		fmt.Fprintf(os.Stderr, "fatal: expected 2 downstream entries, got %d\n", n)
+		os.Exit(1)
+	}
 }
 
 func section(title string) {

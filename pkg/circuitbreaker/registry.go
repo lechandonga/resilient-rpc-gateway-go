@@ -1,6 +1,7 @@
 package circuitbreaker
 
 import (
+	"sort"
 	"sync"
 	"time"
 
@@ -38,6 +39,29 @@ func (r *Registry) Snapshot(now time.Time) map[string]StateName {
 	out := make(map[string]StateName, len(r.breakers))
 	for k, b := range r.breakers {
 		out[k] = b.State(now)
+	}
+	return out
+}
+
+// Stats 返回全部熔断器的统计快照，按 key 排序，保证可复现。
+// 逐个 Breaker 加锁：每个熔断器的字段彼此自洽。
+func (r *Registry) Stats(now time.Time) []model.BreakerStat {
+	r.mu.Lock()
+	keys := make([]string, 0, len(r.breakers))
+	bs := make([]*Breaker, 0, len(r.breakers))
+	for k, b := range r.breakers {
+		keys = append(keys, k)
+		bs = append(bs, b)
+	}
+	r.mu.Unlock()
+	sort.Strings(keys)
+	byKey := make(map[string]*Breaker, len(bs))
+	for _, b := range bs {
+		byKey[b.Key()] = b
+	}
+	out := make([]model.BreakerStat, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, byKey[k].Stat(now))
 	}
 	return out
 }

@@ -6,6 +6,7 @@
 package circuitbreaker
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -134,6 +135,43 @@ func (b *Breaker) State(now time.Time) StateName {
 	defer b.mu.Unlock()
 	b.maybeTransitionLocked(now)
 	return b.state
+}
+
+// RecordAbandon 用于 Allow 已放行（占用了 half-open 探测名额）但下游调用
+// 实际没有发生 / 未产生可信结果的情形：在等并发额度、排队、退避期间被取消，
+// 或预算已耗尽时，归还探测名额但不改变熔断状态——取消绝不能被算作探测成功或失败，
+// 也不能把半开名额永久泄漏。
+func (b *Breaker) RecordAbandon(now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.maybeTransitionLocked(now)
+	if b.state == StateHalfOpen && b.probeInflight > 0 {
+		b.probeInflight--
+	}
+}
+
+// Stat 返回此刻熔断器的自洽统计（先推进过期 open）。
+func (b *Breaker) Stat(now time.Time) model.BreakerStat {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.maybeTransitionLocked(now)
+	st := model.BreakerStat{
+		Key:            b.key,
+		State:          string(b.state),
+		Failures:       b.failures,
+		ProbeInflight:  b.probeInflight,
+		ProbeSucceeded: b.probeSucceeded,
+	}
+	if i := strings.IndexByte(b.key, '#'); i >= 0 {
+		st.InstanceID = b.key[:i]
+		st.Method = b.key[i+1:]
+	}
+	if b.state == StateOpen {
+		if left := b.cooldown - now.Sub(b.openedAt); left > 0 {
+			st.CooldownLeft = left
+		}
+	}
+	return st
 }
 
 // Key 返回维度键。
